@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+#
+# Program to take any number of fields from a excel file (csv or xlsx format)
+# and generate a plot from a series of input files (each may contain several
+# sheets).
+#
+# Author: Arvind Kini (arvindkini@gmail.com)
+#
+# Format Requirements:
+# 1. Cell must be followed by its value in the immediate column
+#
+# Usage Requirements:
+# 1. All fields to be plotted must be on Y axis.
+#    The X-axis field is the sheet name.
+#    So all fields are searched for in the sheet specified (or all sheets by
+#    default).
+#    This may be changed in future.
+
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+import csv
+import getopt, sys, os, math
+import seaborn as sns
+import datetime
+
+# Tunables
+group=""		# unimpl
+logdir="/tmp"	# default work directory where output files are stored
+saveimg=0		# 1=save image to file
+style="line"	# default style of plot
+stdout=0		# write processed plot file to stdout
+nowarn=0		# 1=suppress warning messages
+defimg="jpg"	# default image format
+dpires=300		#image resolution
+debug=0			# debug messages
+edebug=0		# extended debug messages
+showplt=0
+xtype="xx"		# random value indicating the type, default str
+ytype=3			# random value indicating the type, default int
+ycurr=None		# currency conversions if applicable
+nyticks=25		# no of ticks along Y-axis
+_ystep=0		# step interval for Y-axis ticks
+datehdr="Period"
+sheetlabel="Sheet"	# always the first column in the data file
+
+# do not touch the following. It is implementation specific.
+inpfile=""		# input file
+xcol=""
+ycol=""
+hdr_once=0
+warn_once={}
+xlabel=""
+ylabel=""
+title=""		# title of plot
+pltblock=False
+
+# debug
+totalv=0
+
+def helpmsg():
+    print("\
+    [--help]              : show this message and exit\n\
+    [--infile=<file>[,<file>]..][+<file>[,<file>..]..\n\
+                          : input file(s)\n\
+    [--sheet=<name>]      : sheet within a file to process\n\
+    [--outfile=<file>]    : specify output file name/prefix\n\
+    [--logdir=<dir>]      : dir where files resides\n\
+    [--xlabel=<label>]    : Label of X-axis\n\
+    [--ylabel=<label>]    : Label of Y-axis\n\
+    [--xcol=<num>]        : X-axis field index in plot datafile\n\
+    [--ycol=<num>]        : Y-axis field index in plot datafile\n\
+    [--xtype=<val>]       : X-axis field enforced to this val type (str by default)\n\
+    [--ytype=<val>]       : Y-axis field enforced to this val type (num by default)\n\
+    [--ycurr=<val>]       : Y-axis field enforced to this currency\n\
+                            Only inr is supported for now.\n\
+    [--nyticks=<val>]     : No of ticks along Y-axis\n\
+    [--ystep=<val>]       : step interval for ticks along Y-axis\n\
+    [--show]              : show plot on screen\n\
+    [--stdout]            : show output for plot on standard output\n\
+    [--nowarn]            : suppress warnings\n\
+    [--save]              : save plot images (else only displayed)\n\
+    [--title=<plot title>]: title of plot\n\
+    [--style=<hist|bar|histbar>]: plot style\n\
+    [--img=jpg|png]       : type of plot image file (default png)\n\
+    ")
+
+def to_inr(amount):
+	def truncate_float(number, places):
+		return int(number * (10 ** places)) / 10 ** places
+
+	famount=""
+	if amount < 0:
+		famount = "-"
+	amount = abs(amount)
+	if amount < 1e3:
+		famount += str(amount)
+		return famount
+
+	if 1e3 <= amount < 1e5:
+		famount += str(truncate_float((amount / 1e5) * 100, 2)) + "K"
+		return famount
+
+	if 1e5 <= amount < 1e7:
+		famount += str(truncate_float((amount / 1e7) * 100, 2)) + "L"
+		return famount
+
+	if amount > 1e7:
+		famount += str(truncate_float(amount / 1e7, 2)) + "Cr"
+		return famount
+
+def main():
+	global help, debug, inpfile, group, title, logdir, edebug, defimg, saveimg
+	global xlabel, ylabel, xcol, ycol, save, ext, style, stdout, nowarn, hdr_once
+	global xtype, ytype, nyticks, ycurr, _ystep, sheetlabel
+	isheet = None
+	outfile = None
+	_xtype = _ytype = None
+
+	try:
+		opts, args = getopt.gnu_getopt(sys.argv[1:], "a:b:c:Dd:f:hIk:m:o:p:S:T:tV:X:x:Y:y:w",
+			["help", "debug", "infile=", "group=", "title=", "logdir=", "edebug",
+			"xlabel=", "ylabel=", "xcol=", "ycol=", "save", "outfile=",
+			"style=", "nowarn", "stdout", "sheet=", "img=", "ytype=", "xtype=",
+			"nyticks=", "ycurr=", "ystep=" ])
+	except getopt.GetoptError as err:
+		# print help information and exit:
+		print(str(err))  # will print something like "option -a not recognized"
+		print("use help option for usage.")
+		sys.exit(2)
+
+	argc = 0
+	print_version = 0
+	for o, a in opts:
+		if o in ("-h", "--help"):
+			helpmsg()
+			sys.exit()
+		elif o in ("--edebug"):	# force simulate faults
+			edebug = 1
+		elif o in ("-D", "--debug"):	# force simulate faults
+			debug = 1
+		elif o in ("-i", "--infile"):
+			inpfile = a
+		elif o in ("-S", "--sheet"):
+			isheet = a
+		elif o in ("-T", "--title"):
+			title = a
+		elif o in ("-d", "--logdir"):
+			logdir = a
+		elif o in ("-X", "--xlabel"):
+			xlabel = a
+		elif o in ("-Y", "--ylabel"):
+			ylabel = a
+		elif o in ("-a", "--xtype"):
+			_xtype = a
+		elif o in ("-b", "--ytype"):
+			_ytype = a
+		elif o in ("-x", "--xcol"):
+			xcol = a
+		elif o in ("-y", "--ycol"):
+			ycol = a
+		elif o in ("-c", "--ycurr"):
+			ycurr = a
+		elif o in ("-V", "--nyticks"):
+			nyticks = int(a)
+		elif o in ("-p", "--ystep"):
+			_ystep = int(a)
+		elif o in ("-w", "--nowarn"):
+			nowarn = 1
+		elif o in ("-t", "--stdout"):
+			stdout = 1
+		elif o in ("-I", "--save"):
+			saveimg = 1
+		elif o in ("-m", "--img"):
+			defimg = a
+		elif o in ("-f", "--style"):
+			style = a
+		elif o in ("-o", "--outfile"):
+			outfile = a
+		else:
+			assert False, "unsupported option"
+	if debug:
+		print("Using logdir " + logdir)
+
+	# Input sanity checks
+	if not os.path.isdir(logdir):
+		print("Invalid dir: " + logdir)
+		sys.exit()
+	if inpfile == "" or ycol == "":
+		print("--infile, --ycol options must be set.")
+		sys.exit()
+	if xcol == "":
+		print("WARNING: --xcol not specified. Defaulting to 'Sheet'")
+		xcol=sheetlabel	# sheet label by default
+	# fix the types. values do not matter so it is random
+	newval = _ytype
+	if _ytype == None:
+		newval = ytype
+	elif (_ytype == "int"):
+		newval = 3
+	elif (_ytype == "float"):
+		newval = 3.3
+	elif (_ytype == "str"):
+		newval = "3"
+	ytype = newval
+	if ycurr != None and ycurr != "inr":
+		print("Only 'inr' supported for currency value on Y-axis")
+		sys.exit(1)
+	if debug:
+		print("TYPE OF ytype: " + str(type(ytype)))
+	nfiles=0
+	nbatches=0
+	for i in inpfile.split(','):
+		for j in i.split('+'):
+			if not os.path.isfile(j):
+				print("Cannot find file " + j)
+				sys.exit()
+			nfiles += 1
+		nbatches += 1
+
+	if nfiles > 1 and outfile == None:
+		print("--outfile must be specified with a group of files.")
+		print("This option provides the prefix for each batch.")
+		print("Each processed batch will be output as <outfile>-<batch#>.csv")
+		sys.exit(1)
+
+	# internal parameter settings
+	if xlabel == "":
+		xlabel = xcol
+	if debug:
+		print("xcol=" + xcol + ", ycol=" + ycol)
+	infile = inpfile
+	# for a single input file, outfile may follow the same name as infile
+	if nfiles == 1:
+		if outfile != None:
+			if not outfile.startswith('/'):
+				outfile = logdir + '/' + outfile
+		else:
+			if infile.startswith('/'):
+				outfile = infile
+			else:
+				outfile = logdir + '/' + infile
+	findex = 0
+	batchnum = 0
+	lastplt = False
+	if xcol == sheetlabel:
+		fields = ycol.split(',')
+	else:
+		fields = xcol.split(',') + ycol.split(',')
+	if edebug:
+		print(fields)
+	#os.chdir(logdir)
+	for i in inpfile.split(','):
+		ofile = outfile + "-" + str(batchnum) + ".csv"
+		vlist = []
+		# empty out old contents in output file
+		fdw = open(ofile, 'w')
+		fdw.close()
+		for infile in i.split('+'):
+			if (debug):
+				print("Opening Datfile: " + infile)
+
+			# CSV files are processed here
+			if infile.endswith('.csv'):
+				vlist += process_csv(infile, None, fields, xlabel, ofile)
+				#genplot(infile, ',', ofile)
+				ofile = infile
+			else:
+				# xlsx format. need to create a CSV out of the fields and genplot after.
+				# Process file with sheet filters if any
+				vlist += process_xl(infile, isheet, fields, sheetlabel, ofile)
+			findex += 1
+		hdr_once = 0	# next batch must get header  as well.
+		batchnum += 1
+		if batchnum == nbatches:
+			lastplt = True
+		genplot(ofile, ',', None, lastplt)
+
+def mysum(v):
+	global totalv
+	print("mysum:" + str(v))
+	if type(v) != str:
+		totalv = totalv + v
+		return totalv
+
+def genplot(file, sep, ofile=None, lastplt=True):
+	global xcol, ycol, xlabel, ylabel, logdir, title, style, defimg, saveimg
+	global dpires, pltblock, ytype, debug, edebug
+	global nyticks, ycurr, _ystep
+
+	fd = open(file, 'r')
+	cnt = 0
+	hdrline = ""
+	plotok = 0
+	while True:
+		cnt += 1
+		line = fd.readline().strip()
+		if not line:
+			break
+		if edebug:
+			print("[" + file + ":" + str(cnt) + "] " + line)
+		ld = line.split(sep)
+		nf = len(ld)
+		ycoll = ycol.split(',')
+		foundx = foundy = 0
+		for i in range(nf):
+			if ld[i] == xcol:
+				xind = i
+				#if xlabel == "":
+					#xlabel = xcol
+				foundx += 1
+			if ld[i] in ycoll:
+				foundy += 1
+		if not (foundx and foundy ):
+			continue;
+		if foundy != len(ycoll):
+			print("Error: Not all ycol values are found." + str(foundy) + " found. " + str(len(ycoll)) + " specified.")
+			if debug:
+				print(ycoll)
+			continue;
+
+		hdrline = line
+		nhdrf = nf
+		# now that we have found the header line, count no of fields.
+		# dump all lines with this many fields at least into the dat file
+		if debug:
+			print("Debug: header line: " + line)
+			print("xlabel=" + xlabel + ", ylabel=" + ylabel)
+		ocnt = 0
+		if ofile != None:
+			fdw = open(ofile, 'w')
+			fdw.write(hdrline + '\n')
+		while True:
+			l = fd.readline()
+			if not l:
+				break
+			if len(l.split(sep)) < nhdrf:
+				continue
+			ocnt += 1
+			if ofile != None:
+				fdw.write(l)
+		if ofile != None:
+			fdw.close()
+			if debug:
+				print(str(ocnt) + " lines in output file: " + ofile)
+		plotok = 1
+		break
+	fd.close()
+	# Set the figure size
+	#plt.rcParams["figure.figsize"] = [7.00, 3.50]
+	#plt.rcParams["figure.autolayout"] = True
+	if not plotok:
+		return
+	if title == "":
+		title = file
+
+	yvald = np.arange(0,30,1)
+	xvald = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+	## Read a CSV file
+	df = pd.read_csv(file, header=0, usecols=hdrline.split(','), names=hdrline.split(','))
+	#df = pd.read_csv(file)
+	if debug:
+		print(df)
+		#print(df.keys())
+		#print(xcol, ycoll)
+		#print(df.agg(["sum","min","max","mean","median"]))
+		print(df.agg(["min","max"]))
+	# Plot the lines
+	if style == "histbar":
+		df.plot(kind='bar', y=ycoll, x=xcol)
+	else:
+		df.plot(kind=style, y=ycoll, x=xcol)
+
+	legend=[]
+	for i in range(len(ycoll)):
+		legend.append(ycoll[i] + "[" + str(df[ycoll[i]].min()) + "~" + str(df[ycoll[i]].max()) + "]")
+	if (edebug):
+		print("Legend:" + str(legend))
+	plt.legend(legend)
+	#extplt.legend()
+	if style == "histbar":
+		for key in ycoll:
+			print("Generate line plot for : " + key)
+			plt.plot(df[key])
+	#plt.plot(df['Zamato'])
+	#plt.plot(df['Expenses'])
+	plt.title(title)
+	plt.ylabel(ylabel)
+	plt.xlabel(xlabel)
+	# get y-axis value range between all fields and set tick intervals
+	# ToDo : do this only if int or float
+	tmpyticks = nyticks
+	if type(ytype) == int or type(ytype) == float:
+		ystart, yend = plt.gca().get_ylim()
+		xstart, xend = plt.gca().get_xlim()
+		minint = math.floor(math.log10(yend-ystart))
+		if (edebug):
+			print
+			#print(yend, ystart, minint, nyticks)
+		if nyticks < minint:
+			print("WARNING: suboptimal no of ticks on Y-axis.(" + str(nyticks)+"," + str(minint) + "). Try new val with --nyticks option.")
+			tmpyticks = minint
+		if _ystep:
+			stepint = _ystep
+			yticksl = np.arange(int(ystart/stepint)*stepint, int(yend/stepint)*stepint, stepint)
+		else:
+			stepint = pow(10, minint) / ((int(tmpyticks / minint)))
+			yticksl = np.arange(round(int(ystart), -minint),round(int(yend), -minint),stepint)
+		#stepint = pow(10, minint) / (int(tmpyticks))
+		if edebug:
+			print("Y: Min interval = " + str(minint) + ", Step Interval = " + str(stepint))
+		if edebug:
+			print("Y: Tick Values:")
+			print(yticksl)
+		if ycurr == "inr":
+			yticksls = [to_inr(a) for a in yticksl]
+			if edebug:
+				print("Y: Tick Labels :")
+				print(yticksls)
+			ann = 'ymin: ' + to_inr(int(ystart)) + '\n' + 'ymax: ' + to_inr(int(yend))
+		else:
+			yticksls=None
+			ann = 'ymin: ' + str(int(ystart)) + '\n' + 'ymax: ' + str(int(yend))
+		plt.yticks(yticksl, yticksls)
+		plt.annotate(ann, (xend,ystart))
+		plt.locator_params(axis='y', nbins=len(yticksl))
+
+	if saveimg:
+		imgfile = file + "." + defimg
+		print("Successfully create image: " + imgfile)
+		plt.savefig(imgfile, dpi=dpires)
+	# always run show() after saving image. else we see a blank image file :(
+	plt.show(block=lastplt)
+	#sns.lineplot(x='Month',y='Sales', hue='Year', data=df)
+
+def search_coordinate(df_data: pd.DataFrame, search_set: set) -> list:
+	global debug
+
+	nda_values = df_data.values
+	tuple_index = np.where(np.isin(nda_values, [e for e in search_set]))
+	if edebug:
+		print("<-----search coordinates---")
+		print(tuple_index)
+		print("-----end search coordinates--->")
+	return [(row, col, nda_values[row][col], nda_values[row][col+1]) for row, col in zip(tuple_index[0], tuple_index[1])]
+
+def getdfcellval(sheet, df, fields):
+	global debug, warn_once, nowarn
+
+	fields = [f.strip() for f in fields]
+	vlist = search_coordinate(df, set(fields))
+
+	if debug:
+		print("search list results---------")
+		print(vlist)
+		print("---------")
+	dups={}
+	vald={}
+	# walk thru the list and retain only max of the values for duplicates
+	# ideally, avoid putting duplicate names in cells in the entire sheet
+	for tup in vlist:
+		row, col, name, val = tup
+		if name in dups.keys():
+			dups[name] += 1
+			if vald[name] < val:
+				vald[name] = val
+		else:
+			dups[name] = 1
+			vald[name] = val
+	ndups = 0
+	for k in dups.keys():
+		if dups[k] > 1 and not k in warn_once:
+			ndups += 1
+			if not nowarn:
+				print("WARNING: Field '" + str(k) + "' has more than 1 entry in sheet " + str(sheet) + " (total:" + str(dups[k]) + ").")
+				print("WARNING: Taking the max value for " + str(k) + ". Ignoring rest.")
+			warn_once[k] = 1
+	if debug or (ndups and not nowarn):
+		print_vlist(vlist)
+	for tup in vlist:
+		row, col, name, val = tup
+		if val != vald[name]:
+			vlist.remove(tup)
+	# re-arrange values per order of fields into a new list
+	nlist = [()] * len(fields)
+	ind = 0
+	for f in fields:
+		for tup in vlist:
+			row, col, name, val = tup
+			if f == name:
+				# add sheet name
+				#nlist[ind] = (f,) + tup
+				nlist[ind] = tup
+				break
+		ind += 1
+	#print(nlist)
+	return nlist
+		
+def print_vlist(vlist):
+	print(f"\n\n{'row':<4} {'col':<4} {'name':>10} {'val':>10}")
+	[print(f"{row:<4} {col:<4} {name:>10} {val:>10}") for row, col, name, val in vlist]
+	#for row, col, name in vlist:
+	#	print(f"{row:<4} {col:<4} {name:>10} {df.iloc[row][col+1]:>10}")
+
+def cprint(val):
+	global stdout
+	if stdout:
+		sys.stdout.write(str(val))
+
+def print_vlist2csv(title, sheet, fields, vlist, ofile):
+	global hdr_once, datehdr
+	global ytype
+
+	if ofile != None:
+		fdw = open(ofile, 'a')
+	if (hdr_once == 0):
+		cprint(title + ",")
+		if ofile != None:
+			fdw.write(title + ",")
+		for i in fields[:-1]:
+			cprint(str(i) + ",")
+			if ofile != None:
+				fdw.write(str(i) + ",")
+		cprint(fields[-1])
+		cprint('\n')
+		if ofile != None:
+			fdw.write(fields[-1])
+			fdw.write('\n')
+			print("Successfully wrote to " + ofile)
+		hdr_once = 1
+
+	cprint(str(sheet) + ",")
+	if ofile != None:
+		fdw.write(str(sheet) + ",")
+	for tup in vlist[:-1]:
+		#print(tup)
+		row, col, name, val = tup
+		if ((type(val) == int or type(val) == float) and (type(ytype) == int or type(ytype) == float)):
+			val = int(val)
+		elif (type(val) == datetime.datetime):
+			col = datehdr
+			#print(row,col,name,val)
+			#val = str(val)
+		elif (type(val) != type(ytype)):
+			print("Type mismatch: Val: " + str(val) + " ignored. Expected:" + str(type(ytype)) + ", val:" + str(type(val)))
+			continue
+		cprint(str(val) + ",")
+		if ofile != None:
+			fdw.write(str(val) + ",")
+	tup = vlist[-1]
+	row, col, name, val = tup
+	#ToDo: match the above equation and make it efficient in avoiding this
+	# what could be duplicate code.
+	if ((type(val) == int or type(val) == float) and (type(ytype) == int or type(ytype) == float)):
+		val = int(val)
+	elif (type(val) == datetime.datetime):
+		col = datehdr
+		#print(row,col,name,val)
+		#val = str(val)
+	elif (type(val) != type(ytype)):
+		print("Type mismatch: Val: " + str(val) + " ignored. Expected:" + str(type(ytype)) + ", val:" + str(type(val)))
+		return
+	cprint(str(val))
+	cprint('\n')
+	if ofile != None:
+		fdw.write(str(val))
+	if ofile != None:
+		fdw.write('\n')
+		fdw.close()
+
+def print_sheetnames(file, df):
+	print("SHEET NAMES in file:" + file)
+	for i in df:
+		sys.stdout.write(i + ",")
+	sys.stdout.write("\n")
+
+def process_xl(file=None, isheet=None, fields=None, title=None, ofile=None):
+	nlist = []
+	isheets = []
+	if file == None or fields == None:
+		return
+	df = pd.read_excel(file, sheet_name=None)
+	#df = pd.read_excel(file)	# first sheet only
+	# see if selective sheets to be processed
+	nsheets = 0
+	if isheet != None:
+		isheets = isheet.split(',')
+		for i in isheets:
+			if i not in df.keys():
+				print("WARNING: " + i + " not in document")
+			else:
+				nsheets += 1
+		if nsheets == 0:
+			print_sheetnames(file, df)
+		if nsheets == 0:
+			return nlist
+
+	if edebug:
+		print_sheetnames(file, df)
+
+	# process all or selective sheets
+	for sheet in df.keys():
+		if isheet != None and not sheet in isheets:
+			continue
+		if debug:
+			print("Processing Sheet: " + sheet)
+		if edebug:
+			print(df[sheet])
+			print(type(df[sheet]))
+			print(df[sheet].keys())
+			#print(df[sheet].dtypes)
+		vlist = getdfcellval(sheet, df[sheet], fields)
+		if debug:
+			print("------------------------------")
+			print("Got the following vlist for sheet : " + sheet)
+			print(vlist)
+			print("------------------------------")
+		if len(vlist) == len(fields):
+			pr=1
+			for tup in vlist:
+				# row, col, name, val - each tuple is always 4
+				if len(tup) != 4:
+					if not nowarn:
+						print("WARNING: One or more missing cell names, Cannot Process tuple "+ str(tup) + " in sheet: " + str(sheet))
+					else:
+						print("WARNING: One or more missing cell names, Cannot Process sheet: " + str(sheet))
+					pr=0
+					break
+			if pr:
+				print_vlist2csv(title, sheet, fields, vlist, ofile)
+				nlist += vlist
+		else:
+			if not nowarn:
+				print("WARNING: Cannot process: " + str(sheet))
+	#if len(nlist) > 0:
+		#print("Successfully wrote to : " + ofile)
+	return nlist
+
+def process_csv(file=None, isheet=None, fields=None, title=None, ofile=None):
+	sheet = isheet
+	fd = open(file, "r")
+	vlist = list(csv.reader(fd, delimiter=","))
+	fd.close()
+	if debug:
+		print("---->Output of CSV processing to list:")
+		print(vlist)
+	#print_vlist2csv(title, sheet, fields, vlist, ofile)
+	return vlist
+
+if __name__ == "__main__":
+	main()
+
